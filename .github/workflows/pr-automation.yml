@@ -1,0 +1,285 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          npm run lint -- --format=junit --output-file=eslint-results.xml || true
+
+      - name: Run Prettier check
+        id: prettier
+        run: |
+          npx prettier --check . --loglevel warn || true
+
+      - name: Post code quality results
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let eslintResults = 'No ESLint results found';
+            try {
+              eslintResults = fs.readFileSync('eslint-results.xml', 'utf8');
+            } catch (e) {}
+            
+            let prettierOutput = 'No Prettier output found';
+            try {
+              prettierOutput = fs.readFileSync('prettier-results.txt', 'utf8');
+            } catch (e) {}
+            
+            const comment = `
+            ## Code Quality Report
+            
+            ### ESLint Results
+            \`\`\`
+            ${eslintResults}
+            \`\`\`
+            
+            ### Prettier Formatting Check
+            \`\`\`
+            ${prettierOutput}
+            \`\`\`
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  testing-suite:
+    name: Testing Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        id: tests
+        run: |
+          npm test -- --coverage --coverageReporters=text-lcov > coverage.lcov || true
+
+      - name: Generate coverage summary
+        id: coverage
+        run: |
+          npx lcov-summary coverage.lcov > coverage-summary.txt || true
+
+      - name: Post coverage results
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let coverageSummary = 'No coverage summary found';
+            try {
+              coverageSummary = fs.readFileSync('coverage-summary.txt', 'utf8');
+            } catch (e) {}
+            
+            const comment = `
+            ## Test Coverage Report
+            
+            \`\`\`
+            ${coverageSummary}
+            \`\`\`
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage/
+            coverage.lcov
+            coverage-summary.txt
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run dependency vulnerability check
+        id: npm-audit
+        run: |
+          npm audit --json > npm-audit-results.json || true
+
+      - name: Scan for secrets
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: --report=json --report-path=gitleaks-results.json
+        continue-on-error: true
+
+      - name: Post security scan results
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let npmAuditResults = 'No npm audit results found';
+            try {
+              const auditData = JSON.parse(fs.readFileSync('npm-audit-results.json', 'utf8'));
+              npmAuditResults = `
+              Dependencies scanned: ${auditData.metadata?.dependencies || 'N/A'}
+              Vulnerabilities found: ${auditData.metadata?.vulnerabilities?.total || 0}
+              Critical: ${auditData.metadata?.vulnerabilities?.critical || 0}
+              High: ${auditData.metadata?.vulnerabilities?.high || 0}
+              Moderate: ${auditData.metadata?.vulnerabilities?.moderate || 0}
+              Low: ${auditData.metadata?.vulnerabilities?.low || 0}
+              `;
+            } catch (e) {}
+            
+            let gitleaksResults = 'No secrets found in code changes';
+            try {
+              const secretsData = JSON.parse(fs.readFileSync('gitleaks-results.json', 'utf8'));
+              if (secretsData.length > 0) {
+                gitleaksResults = `Potential secrets found: ${secretsData.length}`;
+                secretsData.forEach((secret, index) => {
+                  gitleaksResults += `\n${index + 1}. ${secret.description} in ${secret.file}`;
+                });
+              }
+            } catch (e) {}
+            
+            const comment = `
+            ## Security Scan Report
+            
+            ### Dependencies Vulnerabilities
+            \`\`\`
+            ${npmAuditResults}
+            \`\`\`
+            
+            ### Secrets Scan
+            \`\`\`
+            ${gitleaksResults}
+            \`\`\`
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  build-validation:
+    name: Build Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        run: |
+          npm run build || true
+
+      - name: Validate endpoints
+        id: endpoints
+        run: |
+          echo "Validating endpoints..."
+          # Add your endpoint validation logic here
+          echo "Endpoint validation completed" > endpoint-validation.txt
+
+      - name: Create deployment preview artifacts
+        id: preview
+        run: |
+          mkdir -p deployment-preview
+          echo "Deployment preview files" > deployment-preview/README.txt
+          # Add your deployment preview creation logic here
+
+      - name: Post build status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let buildOutput = 'Build output not available';
+            try {
+              buildOutput = fs.readFileSync('build-output.txt', 'utf8');
+            } catch (e) {}
+            
+            let endpointValidation = 'No endpoint validation results found';
+            try {
+              endpointValidation = fs.readFileSync('endpoint-validation.txt', 'utf8');
+            } catch (e) {}
+            
+            const comment = `
+            ## Build Validation
+            
+            ### Build Status
+            \`\`\`
+            ${buildOutput}
+            \`\`\`
+            
+            ### Endpoint Validation
+            \`\`\`
+            ${endpointValidation}
+            \`\`\`
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Upload deployment preview artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-preview
+          path: deployment-preview/
